@@ -32,7 +32,10 @@ export default class Flatbush {
         const [nodeSize] = new Uint16Array(data, 2, 1);
         const [numItems] = new Uint32Array(data, 4, 1);
 
-        return new Flatbush(numItems, nodeSize, ArrayType, undefined, data);
+        // TODO: parse serialized data
+        const onlyPoints = true;
+
+        return new Flatbush(numItems, nodeSize, ArrayType, undefined, onlyPoints, data);
     }
 
     /**
@@ -41,20 +44,23 @@ export default class Flatbush {
      * @param {number} [nodeSize=16] Size of the tree node (16 by default).
      * @param {TypedArrayConstructor} [ArrayType=Float64Array] The array type used for coordinates storage (`Float64Array` by default).
      * @param {ArrayBufferConstructor | SharedArrayBufferConstructor} [ArrayBufferType=ArrayBuffer] The array buffer type used to store data (`ArrayBuffer` by default).
+     * @param {boolean} [onlyPoints] If only point data will be indexed, set this to `true`, and memory use to store bounding boxes will be halved.
      * @param {ArrayBuffer | SharedArrayBuffer} [data] (Only used internally)
      */
-    constructor(numItems, nodeSize = 16, ArrayType = Float64Array, ArrayBufferType = ArrayBuffer, data) {
+    constructor(numItems, nodeSize = 16, ArrayType = Float64Array, ArrayBufferType = ArrayBuffer, onlyPoints = false, data) {
         if (numItems === undefined) throw new Error('Missing required argument: numItems.');
         if (isNaN(numItems) || numItems <= 0) throw new Error(`Unexpected numItems value: ${numItems}.`);
 
+        this.onlyPoints = Boolean(onlyPoints);
         this.numItems = +numItems;
         this.nodeSize = Math.min(Math.max(+nodeSize, 2), 65535);
+        const elementsPerLeafNode = this.onlyPoints ? 2 : 4;
 
         // calculate the total number of nodes in the R-tree to allocate space for
         // and the index of each tree level (used in search later)
         let n = numItems;
         let numNodes = n;
-        this._levelBounds = [n * 4];
+        this._levelBounds = [n * elementsPerLeafNode];
         do {
             n = Math.ceil(n / this.nodeSize);
             numNodes += n;
@@ -65,7 +71,13 @@ export default class Flatbush {
         this.IndexArrayType = numNodes < 16384 ? Uint16Array : Uint32Array;
 
         const arrayTypeIndex = ARRAY_TYPES.indexOf(this.ArrayType);
-        const nodesByteSize = numNodes * 4 * this.ArrayType.BYTES_PER_ELEMENT;
+        const numIntermediateNodes = numNodes - numItems;
+        const numLeafNodes = numItems;
+        const nodesByteSize =
+            numIntermediateNodes * 4 * this.ArrayType.BYTES_PER_ELEMENT +
+            numLeafNodes *
+                elementsPerLeafNode *
+                this.ArrayType.BYTES_PER_ELEMENT;
 
         if (arrayTypeIndex < 0) {
             throw new Error(`Unexpected typed array class: ${ArrayType}.`);
@@ -74,18 +86,28 @@ export default class Flatbush {
         // @ts-expect-error duck typing array buffers
         if (data && data.byteLength !== undefined && !data.buffer) {
             this.data = data;
-            this._boxes = new this.ArrayType(this.data, 8, numNodes * 4);
+            this._boxes = new this.ArrayType(
+                this.data,
+                8,
+                numIntermediateNodes * 4 + numLeafNodes * elementsPerLeafNode
+            );
             this._indices = new this.IndexArrayType(this.data, 8 + nodesByteSize, numNodes);
 
-            this._pos = numNodes * 4;
+            this._pos =
+                numIntermediateNodes * 4 + numLeafNodes * elementsPerLeafNode;
+            // The root box will always have 4 elements, even when onlyPoints is
+            // true
             this.minX = this._boxes[this._pos - 4];
             this.minY = this._boxes[this._pos - 3];
             this.maxX = this._boxes[this._pos - 2];
             this.maxY = this._boxes[this._pos - 1];
-
         } else {
             this.data = new ArrayBufferType(8 + nodesByteSize + numNodes * this.IndexArrayType.BYTES_PER_ELEMENT);
-            this._boxes = new this.ArrayType(this.data, 8, numNodes * 4);
+            this._boxes = new this.ArrayType(
+                this.data,
+                8,
+                numIntermediateNodes * 4 + numLeafNodes * elementsPerLeafNode
+            );
             this._indices = new this.IndexArrayType(this.data, 8 + nodesByteSize, numNodes);
             this._pos = 0;
             this.minX = Infinity;
@@ -112,13 +134,26 @@ export default class Flatbush {
      * @returns {number} A zero-based, incremental number that represents the newly added rectangle.
      */
     add(minX, minY, maxX, maxY) {
-        const index = this._pos >> 2;
+        if (this.onlyPoints && (minX !== maxX || minY !== maxY)) {
+            throw new Error('Expected only points');
+        }
+
+        // Here we do want to right shift by only >> 1 if onlyPoints is true,
+        // because _pos is the indexes of the data we've added so far
+        const index = this._pos >> this.perNodeRightShift();
         const boxes = this._boxes;
         this._indices[index] = index;
-        boxes[this._pos++] = minX;
-        boxes[this._pos++] = minY;
-        boxes[this._pos++] = maxX;
-        boxes[this._pos++] = maxY;
+        if (this.onlyPoints) {
+            // Only use minX and minY because we already checked that minX ===
+            // maxX and minY === maxY
+            boxes[this._pos++] = minX;
+            boxes[this._pos++] = minY;
+        } else {
+            boxes[this._pos++] = minX;
+            boxes[this._pos++] = minY;
+            boxes[this._pos++] = maxX;
+            boxes[this._pos++] = maxY;
+        }
 
         if (minX < this.minX) this.minX = minX;
         if (minY < this.minY) this.minY = minY;
@@ -130,8 +165,12 @@ export default class Flatbush {
 
     /** Perform indexing of the added rectangles. */
     finish() {
-        if (this._pos >> 2 !== this.numItems) {
-            throw new Error(`Added ${this._pos >> 2} items when expected ${this.numItems}.`);
+        if (this._pos >> this.perNodeRightShift() !== this.numItems) {
+            throw new Error(
+                `Added ${
+                    this._pos >> this.perNodeRightShift()
+                } items when expected ${this.numItems}.`
+            );
         }
         const boxes = this._boxes;
 
@@ -151,6 +190,7 @@ export default class Flatbush {
 
         // map item centers into Hilbert coordinate space and calculate Hilbert values
         for (let i = 0, pos = 0; i < this.numItems; i++) {
+            // todo only add
             const minX = boxes[pos++];
             const minY = boxes[pos++];
             const maxX = boxes[pos++];
@@ -208,27 +248,41 @@ export default class Flatbush {
         }
 
         /** @type number | undefined */
-        let nodeIndex = this._boxes.length - 4;
+        let nodeIndex = this._boxes.length - this.elementsPerNode();
         const queue = [];
         const results = [];
 
         while (nodeIndex !== undefined) {
             // find the end index of the node
-            const end = Math.min(nodeIndex + this.nodeSize * 4, upperBound(nodeIndex, this._levelBounds));
+            const end = Math.min(
+                nodeIndex + this.nodeSize * this.elementsPerNode(),
+                upperBound(nodeIndex, this._levelBounds)
+            );
 
             // search through child nodes
-            for (let /** @type number */ pos = nodeIndex; pos < end; pos += 4) {
+            for (
+                let /** @type number */ pos = nodeIndex;
+                pos < end;
+                pos += this.elementsPerNode()
+            ) {
                 // check if node bbox intersects with query bbox
-                if (maxX < this._boxes[pos]) continue; // maxX < nodeMinX
-                if (maxY < this._boxes[pos + 1]) continue; // maxY < nodeMinY
-                if (minX > this._boxes[pos + 2]) continue; // minX > nodeMaxX
-                if (minY > this._boxes[pos + 3]) continue; // minY > nodeMaxY
+                if (this.onlyPoints) {
+                    if (maxX < this._boxes[pos]) continue; // maxX < nodeMinX
+                    if (maxY < this._boxes[pos + 1]) continue; // maxY < nodeMinY
+                    if (minX > this._boxes[pos]) continue; // minX > nodeMaxX
+                    if (minY > this._boxes[pos + 1]) continue; // minY > nodeMaxY
+                } else {
+                    if (maxX < this._boxes[pos]) continue; // maxX < nodeMinX
+                    if (maxY < this._boxes[pos + 1]) continue; // maxY < nodeMinY
+                    if (minX > this._boxes[pos + 2]) continue; // minX > nodeMaxX
+                    if (minY > this._boxes[pos + 3]) continue; // minY > nodeMaxY
+                }
 
-                const index = this._indices[pos >> 2] | 0;
+                const index =
+                    this._indices[pos >> this.perNodeRightShift()] | 0;
 
-                if (nodeIndex >= this.numItems * 4) {
+                if (nodeIndex >= this.numItems * this.elementsPerNode()) {
                     queue.push(index); // node; add it to the search queue
-
                 } else if (filterFn === undefined || filterFn(index)) {
                     results.push(index); // leaf item
                 }
@@ -255,31 +309,49 @@ export default class Flatbush {
         }
 
         /** @type number | undefined */
-        let nodeIndex = this._boxes.length - 4;
+        let nodeIndex = this._boxes.length - this.elementsPerNode();
         const q = this._queue;
         const results = [];
         const maxDistSquared = maxDistance * maxDistance;
 
         outer: while (nodeIndex !== undefined) {
             // find the end index of the node
-            const end = Math.min(nodeIndex + this.nodeSize * 4, upperBound(nodeIndex, this._levelBounds));
+            const end = Math.min(
+                nodeIndex + this.nodeSize * this.elementsPerNode(),
+                upperBound(nodeIndex, this._levelBounds)
+            );
 
             // add child nodes to the queue
-            for (let pos = nodeIndex; pos < end; pos += 4) {
-                const index = this._indices[pos >> 2] | 0;
+            for (
+                let pos = nodeIndex;
+                pos < end;
+                pos += this.elementsPerNode()
+            ) {
+                const index =
+                    this._indices[pos >> this.perNodeRightShift()] | 0;
 
-                const dx = axisDist(x, this._boxes[pos], this._boxes[pos + 2]);
-                const dy = axisDist(y, this._boxes[pos + 1], this._boxes[pos + 3]);
+                const boxMinX = this._boxes[pos];
+                const boxMinY = this._boxes[pos + 1];
+                const boxMaxX = this.onlyPoints ?
+                    this._boxes[pos] :
+                    this._boxes[pos + 2];
+                const boxMaxY = this.onlyPoints ?
+                    this._boxes[pos + 1] :
+                    this._boxes[pos + 3];
+
+                const dx = axisDist(x, boxMinX, boxMaxX);
+                const dy = axisDist(y, boxMinY, boxMaxY);
                 const dist = dx * dx + dy * dy;
                 if (dist > maxDistSquared) continue;
 
-                if (nodeIndex >= this.numItems * 4) {
+                if (nodeIndex >= this.numItems * this.elementsPerNode()) {
                     q.push(index << 1, dist); // node (use even id)
-
                 } else if (filterFn === undefined || filterFn(index)) {
                     q.push((index << 1) + 1, dist); // leaf item (use odd id)
                 }
             }
+
+            // TODO(kyle): unfamiliar with neighbors(); check validity of below
 
             // pop items from the queue
             // @ts-expect-error q.length check eliminates undefined values
@@ -298,6 +370,32 @@ export default class Flatbush {
 
         q.clear();
         return results;
+    }
+
+    /**
+     * The number of elements per node.
+     *
+     * This will be 2 when `onlyPoints` is `true`, as only the x and y point
+     * coordinates are indexed directly, and 4 when `false` as the four box
+     * coordinates are indexed.
+     *
+     * @returns {2 | 4} The number of elements per node.
+     */
+    elementsPerNode() {
+        return this.onlyPoints ? 2 : 4;
+    }
+
+    /**
+     * The right shift to apply for boxes, depending on whether the index
+     * contains only points
+     *
+     * This will be 1 when `onlyPoints` is `true`, as each box contains two
+     * coordinates, and 2 when `onlyPoints` is `false`.
+     *
+     * @returns {1 | 2} The number of elements per node.
+     */
+    perNodeRightShift() {
+        return this.onlyPoints ? 1 : 2;
     }
 }
 
@@ -396,6 +494,7 @@ function swap(values, boxes, indices, i, j) {
  * Ported from C++ https://github.com/rawrunprotected/hilbert_curves (public domain)
  * @param {number} x
  * @param {number} y
+ * @returns {number} Hilbert code
  */
 function hilbert(x, y) {
     let a = x ^ y;
